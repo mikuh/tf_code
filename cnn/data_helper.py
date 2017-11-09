@@ -150,10 +150,10 @@ def transfer_inputs(filename, batch_size, num_preprocess_threads, min_queue_exam
     features = tf.parse_single_example(serialized_example,
                                        features={
                                            'label': tf.FixedLenFeature([], tf.int64),
-                                           'img_raw': tf.FixedLenFeature([], tf.string),
+                                           'img_coding': tf.FixedLenFeature([], tf.string),
                                        })  # 将image数据和label取出来
 
-    img_coding = tf.decode_raw(features['img_raw'], tf.float32)
+    img_coding = tf.decode_raw(features['img_coding'], tf.float32)
     img_coding = tf.reshape(img_coding, [-1])
     label = tf.cast(features['label'], tf.int32)
 
