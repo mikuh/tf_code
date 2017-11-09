@@ -10,7 +10,8 @@ class CNNClassify(object):
     """
     def __init__(self, batch_size, num_classes, num_train_examples, initial_lr=0.1, lr_decay_factor=0.1,
                  moving_average_decay=0.9999, num_epochs_per_decay=300, log_frequency=10,
-                 max_steps=200000, checkpoint_every=5000):
+                 max_steps=200000, checkpoint_every=5000, session_conf=tf.ConfigProto(allow_soft_placement=True, log_device_placement=True,
+                                           gpu_options=tf.GPUOptions(per_process_gpu_memory_fraction=0.3))):
         self.batch_size = batch_size
         self.num_classes = num_classes
         self.moving_average_decay = moving_average_decay  # 用于移动平均的衰减
@@ -22,8 +23,7 @@ class CNNClassify(object):
         self.max_steps = max_steps
         self.checkpoint_every = checkpoint_every  # 多少步之后保存一次模型
         self.num_checkpoints = 5
-        self.session_conf = tf.ConfigProto(allow_soft_placement=True, log_device_placement=True,
-                                           gpu_options=tf.GPUOptions(per_process_gpu_memory_fraction=0.3))
+        self.session_conf = session_conf
 
 
     def _variable_on_cpu(self, name, shape, initializer):
