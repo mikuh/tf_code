@@ -10,7 +10,7 @@ class CNNClassify(object):
     """
     def __init__(self, batch_size, num_classes, num_train_examples, initial_lr=0.1, lr_decay_factor=0.1,
                  moving_average_decay=0.9999, num_epochs_per_decay=300, log_frequency=10,
-                 max_steps=200000, checkpoint_every=5000, session_conf=tf.ConfigProto(allow_soft_placement=True, log_device_placement=True,
+                 max_steps=200000, checkpoint_every=5000, num_gpus=4, session_conf=tf.ConfigProto(allow_soft_placement=True, log_device_placement=True,
                                            gpu_options=tf.GPUOptions(per_process_gpu_memory_fraction=0.3))):
         self.batch_size = batch_size
         self.num_classes = num_classes
@@ -23,6 +23,7 @@ class CNNClassify(object):
         self.max_steps = max_steps
         self.checkpoint_every = checkpoint_every  # 多少步之后保存一次模型
         self.num_checkpoints = 5
+        self.num_gpus = num_gpus
         self.session_conf = session_conf
 
 
@@ -57,6 +58,30 @@ class CNNClassify(object):
         tf.summary.histogram(tensor_name + '/activations', x)
         tf.summary.scalar(tensor_name + '/sparsity', tf.nn.zero_fraction(x))
 
+    def average_gradients(self, tower_grads):
+        """计算所有tower上所有变量的平均梯度
+        """
+        average_grads = []
+        for grad_and_vars in zip(*tower_grads):
+            # 每个梯度和变量类似这样:
+            #   ((grad0_gpu0, var0_gpu0), ... , (grad0_gpuN, var0_gpuN))
+            grads = []
+            for g, _ in grad_and_vars:
+                # 添加一个0维度来代表tower  [grad0_gpuN]
+                expanded_g = tf.expand_dims(g, 0)
+
+                # [[grad0_gpu1],...,[grad0_gpuN]]
+                grads.append(expanded_g)
+
+            # 在tower上进行平均  (上面加维度那部分没理解 加了又合 不是白操作吗？,后续再研究一下)
+            grad = tf.concat(axis=0, values=grads)  # [grad0_gpu1,..., grad0_gpuN]
+            grad = tf.reduce_mean(grad, 0)          # 平均梯度
+
+            # 把变量拼接回去
+            v = grad_and_vars[0][1]
+            grad_and_var = (grad, v)
+            average_grads.append(grad_and_var)
+        return average_grads
 
 
     def inference(self, images):
@@ -137,6 +162,18 @@ class CNNClassify(object):
         # decay terms (L2 loss).
         return tf.add_n(tf.get_collection('losses'), name='total_loss')
 
+    def tower_loss(self, scope, logits, labels):
+        _ = self.loss(logits, labels)
+        # 把所有损失都集中到当前tower上
+        losses = tf.get_collection('losses', scope)
+        total_loss = tf.add_n(losses, name='total_loss')
+        for l in losses + [total_loss]:
+            # 去掉变量名前缀 tower_[0-9],变成和单GPU的时候一样
+            loss_name = re.sub('%s_[0-9]*/' % TOWER_NAME, '', l.op.name)
+            tf.summary.scalar(loss_name, l)
+
+        return total_loss
+
     def evaluation(self, logits, labels, k=1):
         """评估函数
         :param logits: 预测
@@ -144,7 +181,19 @@ class CNNClassify(object):
         """
         correct = tf.nn.in_top_k(logits, labels, k=k)
         # correct = tf.equal(self.predictions, tf.argmax(labels, 1))
-        return tf.reduce_mean(tf.cast(correct, tf.float32), name='accuracy')
+        accuracy = tf.reduce_mean(tf.cast(correct, tf.float32))
+        tf.add_to_collection('accuracy', accuracy)
+        return tf.add_n(tf.get_collection('accuracy'), name='accuracy')
+
+    def tower_evaluation(self, scope, logits, labels, k=1):
+        """多gpu的评估函数
+        """
+        _ = self.evaluation(logits, labels, k)
+        accuracy = tf.get_collection('accuracy', scope)
+        total_accuracy = tf.reduce_mean(accuracy, axis=0, name='total_accuracy')
+        return total_accuracy
+
+
 
     def _add_loss_summaries(self, total_loss):
         """增加损失摘要
@@ -204,7 +253,7 @@ class CNNClassify(object):
     def train_step(self, sess, summary_writer):
         """单步训练
         """
-        _, step, cur_loss, cur_acc = sess.run([self.train_op, self.global_step, self.loss, self.accuracy])
+        _, step, cur_loss, cur_acc = sess.run([self.train_op, self.global_step, self._loss, self.accuracy])
         time_str = datetime.datetime.now().isoformat()
         print("{}: step {}, loss {:g}, acc {:g}".format(time_str, step, cur_loss, cur_acc))
         # 存储摘要
@@ -225,8 +274,8 @@ class CNNClassify(object):
                 with tf.device('/cpu:0'):
                     images, labels = data_helper.distorted_inputs(filename, self.batch_size)
                 logits = self.inference(images)
-                self.loss = self.loss(logits, labels)
-                self.train_op = self.train_operation(self.loss, self.global_step)
+                self._loss = self.loss(logits, labels)
+                self.train_op = self.train_operation(self._loss, self.global_step)
                 self.accuracy = self.evaluation(logits, labels)
                 self.summary = tf.summary.merge_all()
 
@@ -255,3 +304,107 @@ class CNNClassify(object):
                         path = saver.save(sess, checkpoint_prefix, global_step=cur_step)
                         print("Saved model checkpoint to {}\n".format(path))
 
+
+    def multi_gpu_train(self, filename, out_dir):
+        with tf.Graph().as_default(), tf.device('/cpu:0'):
+            sess = tf.Session(config=self.session_conf)
+            with sess.as_default():
+                # Create a variable to count the number of train() calls. This equals the
+                # number of batches processed * FLAGS.num_gpus.
+                self.global_step = tf.get_variable('global_step', [], initializer=tf.constant_initializer(0), trainable=False)
+
+
+                # 学习速率衰减设置
+                num_batches_per_epoch = self.num_train_examples / self.batch_size
+                decay_steps = int(num_batches_per_epoch * self.num_epochs_per_decay)
+
+                # 根据步数衰减学习速率
+                lr = tf.train.exponential_decay(self.initial_lr, self.global_step, decay_steps, self.lr_decay_factor,
+                                                staircase=True)
+                # 执行梯度下降的优化器
+                opt = tf.train.GradientDescentOptimizer(lr)
+
+                images, labels = data_helper.distorted_inputs(filename, self.batch_size)  # 取出数据
+                # 批次队列 这个函数不是很懂
+                batch_queue = tf.contrib.slim.prefetch_queue.prefetch_queue([images, labels], capacity=2 * self.num_gpus)
+
+                tower_grads = []
+                summaries = None
+                with tf.variable_scope(tf.get_variable_scope()):
+                    for i in range(self.num_gpus):
+                        with tf.device('/gpu:{}'.format(i)):
+                            with tf.name_scope('{}_{}'.format(TOWER_NAME, i)) as scope:
+                                # 为gpu列出一个批次
+                                image_batch, label_batch = batch_queue.dequeue()
+                                # 计算一个tower的损失. 并且每个tower共享权重变量
+                                logits = self.inference(image_batch)
+                                self._loss = self.tower_loss(scope, logits, label_batch)
+                                self.accuracy = self.tower_evaluation(scope, logits, label_batch)
+                                # 下一个tower复用变量
+                                tf.get_variable_scope().reuse_variables()
+
+                                # 保存最终tower的摘要
+                                summaries = tf.get_collection(tf.GraphKeys.SUMMARIES, scope)
+
+                                # 计算梯度
+                                grads = opt.compute_gradients(self._loss)
+
+                                # 跟踪所有tower的梯度
+                                tower_grads.append(grads)
+
+                grads = self.average_gradients(tower_grads)  # 平均梯度
+
+                # 添加学习速率的摘要
+                summaries.append(tf.summary.scalar('learning_rate', lr))
+
+                # 添加梯度直方图
+                for grad, var in grads:
+                    if grad is not None:
+                        summaries.append(tf.summary.histogram(var.op.name + '/gradients', grad))
+
+                # 应用梯度来调整共享变量
+                apply_gradient_op = opt.apply_gradients(grads, global_step=self.global_step)
+
+                # 所有可训练变量添加直方图
+                for var in tf.trainable_variables():
+                    summaries.append(tf.summary.histogram(var.op.name, var))
+
+                # 跟踪所有可训练变量的移动平均线
+                variable_averages = tf.train.ExponentialMovingAverage(self.moving_average_decay, self.global_step)
+                variables_averages_op = variable_averages.apply(tf.trainable_variables())
+
+
+                # 将所有更新集中到一个训练操作
+                self.train_op = tf.group(apply_gradient_op, variables_averages_op)
+
+
+                # 从最后的tower总结摘要
+                self.summary = tf.summary.merge(summaries)
+
+
+                # 保存点设置
+                checkpoint_dir = os.path.abspath(os.path.join(out_dir, "checkpoints"))
+                checkpoint_prefix = os.path.join(checkpoint_dir, "model")  # 模型存储前缀
+                if not os.path.exists(checkpoint_dir):
+                    os.makedirs(checkpoint_dir)
+                saver = tf.train.Saver(tf.global_variables(), max_to_keep=self.num_checkpoints)
+                summary_writer = tf.summary.FileWriter(out_dir + "/summary", sess.graph)
+
+                # 初始化所有变量
+                ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
+                if ckpt and tf.train.checkpoint_exists(ckpt.model_checkpoint_path):
+                    saver.restore(sess, ckpt.model_checkpoint_path)
+                else:
+                    sess.run(tf.global_variables_initializer())
+
+
+                # 启动队列
+                tf.train.start_queue_runners(sess=sess)
+
+                for step in range(self.max_steps):
+                    self.train_step(sess, summary_writer)  # 训练
+                    cur_step = tf.train.global_step(sess, self.global_step)
+                    # checkpoint_every 次迭代之后 保存模型
+                    if cur_step % self.checkpoint_every == 0 and cur_step != 0:
+                        path = saver.save(sess, checkpoint_prefix, global_step=cur_step)
+                        print("Saved model checkpoint to {}\n".format(path))

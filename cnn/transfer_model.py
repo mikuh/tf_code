@@ -28,11 +28,8 @@ class InceptionTransfer(object):
         self.checkpoint_every = checkpoint_every    # 多少步之后保存模型
 
     def inference(self, images):
-        # 占位符
-        # with tf.name_scope('input'):
-        #     images_placeholder = tf.placeholder(tf.float32, shape=(self.batch_size, self.image_pixels), name='image')
-        #     labels_placeholder = tf.placeholder(tf.int32, shape=(self.batch_size), name='label')
-
+        """向前传播
+        """
         # Hidden
         with tf.name_scope('hidden'):
             weights = tf.Variable(tf.truncated_normal([self.image_pixels, self.num_hidden_units],
