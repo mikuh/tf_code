@@ -15,7 +15,7 @@ class PTBModel(object):
 
     def __init__(self, batch_size, num_steps, unit_size, num_layers, vocab_size, initial_lr, lr_decay_factor,
                  keep_prob, max_grad_norm=15, emb=False, is_training=True, num_epochs_per_decay=5, num_checkpoints=5,
-                 checkpoint_every=4000, epoch_size=20):
+                 checkpoint_every=4000, epoch_size=20, max_step=200000):
         self.batch_size = batch_size                                # 批次大小
         self.num_steps = num_steps                                  # lstm时间步数
         self.unit_size = unit_size                                  # lstm单元神经元个数
@@ -30,6 +30,7 @@ class PTBModel(object):
         self.num_checkpoints = num_checkpoints                      # 保存点个数
         self.checkpoint_every = checkpoint_every                    # 每checkpoint_every步保存模型
         self.epoch_size = epoch_size                                # 训练几轮
+        self.max_step = max_step                                    # 训练几步
         self.num_epochs_per_decay = num_epochs_per_decay
 
     def build_rnn_graph(self, inputs, keep_prob):
@@ -41,15 +42,13 @@ class PTBModel(object):
         if self.is_training and keep_prob < 1:
             lstm_cell = tf.contrib.rnn.DropoutWrapper(lstm_cell, output_keep_prob=keep_prob)
 
-        # 多层lstm
+        # 堆叠多层
         stacked_lstm = tf.contrib.rnn.MultiRNNCell([lstm_cell for _ in range(self.num_layers)], state_is_tuple=True)
-        # 初始状态为0
         initial_state = state = stacked_lstm.zero_state(self.batch_size, tf.float32)
 
         outputs = []
         with tf.variable_scope("RNN"):
             for time_step in range(self.num_steps):
-                # 后面的时间步数复用第一步的权重变量
                 if time_step > 0:
                     tf.get_variable_scope().reuse_variables()
                 cell_output, state = stacked_lstm(inputs[:, time_step, :], state)
@@ -78,6 +77,7 @@ class PTBModel(object):
             softmax_w = tf.get_variable("softmax_w", [self.unit_size, self.vocab_size], dtype=tf.float32)
             softmax_b = tf.get_variable("softmax_b", [self.vocab_size], dtype=tf.float32)
             logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b, name='logits')
+            logits = tf.reshape(logits, [self.batch_size, self.num_steps, self.vocab_size])
         else:
             logits = tf.reshape(output, [self.batch_size, self.num_steps, self.vocab_size], name='logits')
 
@@ -121,22 +121,25 @@ class PTBModel(object):
         train_op = optimizer.apply_gradients(zip(grads, tvars), global_step=global_step)
         return train_op
 
-    def train_step(self, sess, x, y, summary_writer):
+    def train_step(self, sess, x=None, y=None, summary_writer=None):
         """单批次训练
         """
-        feed_dict = {
-            self.inputs: x,
-            self.targets: y,
-        }
-        _, step, cur_loss = sess.run([self.train_op, self.global_step, self._loss], feed_dict=feed_dict)
+        if not self.emb:
+            feed_dict = {
+                self.inputs: x,
+                self.targets: y,
+            }
+            _, step, cur_loss = sess.run([self.train_op, self.global_step, self._loss], feed_dict=feed_dict)
+        else:
+            _, step, cur_loss = sess.run([self.train_op, self.global_step, self._loss])
         self.costs += cur_loss
-        self.iters += self.num_steps * self.batch_size
+        self.iters += self.num_steps
         train_perplexity = np.exp(self.costs / self.iters)
         time_str = datetime.datetime.now().isoformat()
         print("{}: step {}, loss {:g}, perplexity {:g}".format(time_str, step, cur_loss, train_perplexity))
         # 存储摘要
         if step % 100 == 0:
-            summary_str = sess.run(self.summary, feed_dict=feed_dict)
+            summary_str = sess.run(self.summary, feed_dict=feed_dict) if not self.emb else sess.run(self.summary)
             summary_writer.add_summary(summary_str, step)
             summary_writer.flush()
 
@@ -144,13 +147,18 @@ class PTBModel(object):
     def train(self, filename, out_dir):
         """训练
         """
-        train_data = data_helper.batch_iter(filename, self.batch_size)
+        train_data = None
+        if not self.emb:
+            train_data = data_helper.batch_iter(filename, self.batch_size)
         with tf.Graph().as_default():
             sess = tf.Session()
             with sess.as_default():
                 self.global_step = tf.Variable(0, name="global_step", trainable=False)  # 步数
-                self.inputs = tf.placeholder(tf.float32, shape=[None, self.num_steps, self.vocab_size], name='inputs')
-                self.targets = tf.placeholder(tf.float32, shape=[None, self.num_steps, self.vocab_size], name='targets')
+                if not self.emb:
+                    self.inputs = tf.placeholder(tf.float32, shape=[None, self.num_steps, self.vocab_size], name='inputs')
+                    self.targets = tf.placeholder(tf.float32, shape=[None, self.num_steps, self.vocab_size], name='targets')
+                else:
+                    self.inputs, self.targets = data_helper.ptb_producer(filename, self.batch_size, self.num_steps)
                 self.logits = self.inference(self.inputs, self.keep_prob)
                 self._loss = self.loss(self.logits, self.targets)
                 self.train_op = self.train_operation(self._loss, self.global_step)
@@ -173,10 +181,21 @@ class PTBModel(object):
 
                 self.costs = 0
                 self.iters = 0
-                for batch_inputs, batch_targets, _ in train_data:
-                    self.train_step(sess, batch_inputs, batch_targets, summary_writer)  # 训练
-                    cur_step = tf.train.global_step(sess, self.global_step)
-                    # checkpoint_every 次迭代之后 保存模型
-                    if cur_step % self.checkpoint_every == 0 and cur_step != 0:
-                        path = saver.save(sess, checkpoint_prefix, global_step=cur_step)
-                        print("Saved model checkpoint to {}\n".format(path))
+                if not self.emb:
+                    for batch_inputs, batch_targets, _ in train_data:
+                        self.train_step(sess, batch_inputs, batch_targets, summary_writer)  # 训练
+                        cur_step = tf.train.global_step(sess, self.global_step)
+                        # checkpoint_every 次迭代之后 保存模型
+                        if cur_step % self.checkpoint_every == 0 and cur_step != 0:
+                            path = saver.save(sess, checkpoint_prefix, global_step=cur_step)
+                            print("Saved model checkpoint to {}\n".format(path))
+                else:
+                    tf.train.start_queue_runners(sess=sess)
+                    for i in range(self.max_step):
+                        self.train_step(sess, summary_writer=summary_writer)  # 训练
+                        cur_step = tf.train.global_step(sess, self.global_step)
+                        # checkpoint_every 次迭代之后 保存模型
+                        if cur_step % self.checkpoint_every == 0 and cur_step != 0:
+                            path = saver.save(sess, checkpoint_prefix, global_step=cur_step)
+                            print("Saved model checkpoint to {}\n".format(path))
+
