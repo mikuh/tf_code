@@ -13,20 +13,23 @@ class PTBModel(object):
     ptb模型
     """
 
-    def __init__(self, hparams, initial_lr, lr_decay_factor, num_examples, max_grad_norm=15, emb=False,
-                 is_training=True, num_epochs_per_decay=5, num_checkpoints=5):
-        self.batch_size = batch_size = hparams.batch_size           # 批次大小
-        self.num_steps = num_steps = hparams.num_steps              # lstm时间步数
-        self.unit_size = hparams.unit_size                          # lstm单元神经元个数
-        self.num_layers = hparams.num_layers                        # lstm层数
-        self.vocab_size = hparams.vocab_size                        # 词向量维度
+    def __init__(self, batch_size, num_steps, unit_size, num_layers, vocab_size, initial_lr, lr_decay_factor,
+                 keep_prob, max_grad_norm=15, emb=False, is_training=True, num_epochs_per_decay=5, num_checkpoints=5,
+                 checkpoint_every=4000, epoch_size=20):
+        self.batch_size = batch_size                                # 批次大小
+        self.num_steps = num_steps                                  # lstm时间步数
+        self.unit_size = unit_size                                  # lstm单元神经元个数
+        self.num_layers = num_layers                                # lstm层数
+        self.vocab_size = vocab_size                                # 词向量维度
         self.initial_lr = initial_lr                                # 最初的学习速率
         self.lr_decay_factor = lr_decay_factor                      # 学习速率衰减因子
+        self.keep_prob = keep_prob                                  # drop keep 概率
         self.max_grad_norm = max_grad_norm                          # 限制最大梯度
         self.emb = emb                                              # 是否词嵌入
         self.is_training = is_training                              # 是否在训练
         self.num_checkpoints = num_checkpoints                      # 保存点个数
-        self.epoch_size = ((len(num_examples) // batch_size) - 1) // num_steps
+        self.checkpoint_every = checkpoint_every                    # 每checkpoint_every步保存模型
+        self.epoch_size = epoch_size                                # 训练几轮
         self.num_epochs_per_decay = num_epochs_per_decay
 
     def build_rnn_graph(self, inputs, keep_prob):
@@ -74,21 +77,35 @@ class PTBModel(object):
         if self.emb:
             softmax_w = tf.get_variable("softmax_w", [self.unit_size, self.vocab_size], dtype=tf.float32)
             softmax_b = tf.get_variable("softmax_b", [self.vocab_size], dtype=tf.float32)
-            logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
+            logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b, name='logits')
         else:
-            logits = tf.reshape(output, [self.batch_size, self.num_steps, self.vocab_size])
+            logits = tf.reshape(output, [self.batch_size, self.num_steps, self.vocab_size], name='logits')
 
         return logits
+
+
+    def feature2cos_sim(self, x, y):
+        norm_x = tf.sqrt(tf.reduce_sum(tf.square(x), 1))
+        norm_y = tf.sqrt(tf.reduce_sum(tf.square(y), 1))
+        mul_x_y = tf.reduce_sum(tf.multiply(x, y), 1)
+        cos_sim_x_y = tf.div(mul_x_y, tf.multiply(norm_x, norm_y))
+        return cos_sim_x_y
 
 
     def loss(self, logits, targets):
         """损失函数
         """
-        loss = tf.contrib.seq2seq.sequence_loss(
-            logits, targets,
-            tf.ones([self.batch_size, self.num_steps], dtype=tf.float32),
-            average_across_timesteps=False,
-            average_across_batch=True)
+        if self.emb:
+            loss = tf.contrib.seq2seq.sequence_loss(
+                logits, targets,
+                tf.ones([self.batch_size, self.num_steps], dtype=tf.float32),
+                average_across_timesteps=False,
+                average_across_batch=True)
+            return tf.reduce_sum(loss, name='loss')
+        logits = tf.reshape(logits, [-1, 128])
+        targets = tf.reshape(targets, [-1, 128])
+        loss = tf.constant(1.0) - self.feature2cos_sim(logits, targets)
+        loss = tf.reshape(loss, [-1])
         return tf.reduce_sum(loss, name='loss')
 
     def train_operation(self, loss, global_step):
@@ -104,18 +121,22 @@ class PTBModel(object):
         train_op = optimizer.apply_gradients(zip(grads, tvars), global_step=global_step)
         return train_op
 
-    def train_step(self, sess, summary_writer,):
+    def train_step(self, sess, x, y, summary_writer):
         """单批次训练
         """
-        _, step, cur_loss, cur_acc = sess.run([self.train_op, self.global_step, self._loss, self.accuracy])
+        feed_dict = {
+            self.inputs: x,
+            self.targets: y,
+        }
+        _, step, cur_loss = sess.run([self.train_op, self.global_step, self._loss], feed_dict=feed_dict)
         self.costs += cur_loss
-        self.iters += self.num_steps
+        self.iters += self.num_steps * self.batch_size
         train_perplexity = np.exp(self.costs / self.iters)
         time_str = datetime.datetime.now().isoformat()
-        print("{}: step {}, loss {:g}, perplexity {:g} acc {:g}".format(time_str, step, cur_loss, train_perplexity, cur_acc))
+        print("{}: step {}, loss {:g}, perplexity {:g}".format(time_str, step, cur_loss, train_perplexity))
         # 存储摘要
         if step % 100 == 0:
-            summary_str = sess.run(self.summary)
+            summary_str = sess.run(self.summary, feed_dict=feed_dict)
             summary_writer.add_summary(summary_str, step)
             summary_writer.flush()
 
@@ -123,16 +144,16 @@ class PTBModel(object):
     def train(self, filename, out_dir):
         """训练
         """
+        train_data = data_helper.batch_iter(filename, self.batch_size)
         with tf.Graph().as_default():
-            sess = tf.Session(config=self.session_conf)
+            sess = tf.Session()
             with sess.as_default():
-                self.global_step = tf.contrib.framework.get_or_create_global_step()
-                with tf.device('/cpu:0'):
-                    inputs, targets = data_helper.distorted_inputs(filename, self.batch_size)
-                logits = self.inference(inputs, )
-                self._loss = self.loss(logits, targets)
+                self.global_step = tf.Variable(0, name="global_step", trainable=False)  # 步数
+                self.inputs = tf.placeholder(tf.float32, shape=[None, self.num_steps, self.vocab_size], name='inputs')
+                self.targets = tf.placeholder(tf.float32, shape=[None, self.num_steps, self.vocab_size], name='targets')
+                self.logits = self.inference(self.inputs, self.keep_prob)
+                self._loss = self.loss(self.logits, self.targets)
                 self.train_op = self.train_operation(self._loss, self.global_step)
-                self.accuracy = self.evaluation(logits, targets)
                 self.summary = tf.summary.merge_all()
 
                 # 保存点设置
@@ -150,11 +171,10 @@ class PTBModel(object):
                 else:
                     sess.run(tf.global_variables_initializer())
 
-                tf.train.start_queue_runners(sess=sess)
                 self.costs = 0
                 self.iters = 0
-                for step in range(self.max_steps):
-                    self.train_step(sess, summary_writer)  # 训练
+                for batch_inputs, batch_targets, _ in train_data:
+                    self.train_step(sess, batch_inputs, batch_targets, summary_writer)  # 训练
                     cur_step = tf.train.global_step(sess, self.global_step)
                     # checkpoint_every 次迭代之后 保存模型
                     if cur_step % self.checkpoint_every == 0 and cur_step != 0:
